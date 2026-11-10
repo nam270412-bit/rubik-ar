@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>AR Rubik's Cube Tracker</title>
+<style>
+:root{--bg:#0b0d14;--glass:rgba(20,24,40,.55);--bd:rgba(255,255,255,.22);--tx:#f2f4ff;--ac:#7c9cff}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);font-family:system-ui,"Noto Sans Thai",sans-serif;overflow:hidden;touch-action:manipulation}
+#app{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+#stage{position:relative;width:100%;height:100%;background:#000;overflow:hidden}
+#stage video,#stage canvas{position:absolute;left:0;top:0;width:100%;height:100%}
+#gl{pointer-events:none}
+.glass{backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);background:var(--glass);border:1px solid var(--bd);border-radius:18px}
+#top{position:fixed;left:10px;right:10px;top:calc(10px + env(safe-area-inset-top,0px));padding:10px 14px;font-size:14px;line-height:1.4;z-index:5}
+#dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#888;margin-right:8px}
+#bar{position:fixed;left:10px;right:10px;bottom:calc(10px + env(safe-area-inset-bottom,0px));padding:10px;z-index:5;display:flex;flex-direction:column;gap:8px}
+#row{display:flex;gap:8px;flex-wrap:wrap}
+button{flex:1 1 120px;min-height:52px;border:1px solid var(--bd);border-radius:14px;background:rgba(124,156,255,.25);color:var(--tx);font-size:15px;font-weight:600;font-family:inherit}
+button:active{background:rgba(124,156,255,.55)}
+button:disabled{opacity:.4}
+#opw{display:flex;align-items:center;gap:10px;font-size:13px}
+#opw input{flex:1;height:28px}
+</style>
+</head>
+<body>
+<div id="app"><div id="stage">
+<video id="video" playsinline muted autoplay></video>
+<canvas id="gl"></canvas>
+<canvas id="ov"></canvas>
+</div></div>
+<div id="top" class="glass"><span id="dot"></span><span id="status">กำลังเริ่มต้น…</span></div>
+<div id="bar" class="glass">
+<div id="opw"><span>ความทึบโมเดล</span><input id="op" type="range" min="20" max="100" value="75"></div>
+<div id="row">
+<button id="bCam">เปิดกล้อง</button>
+<button id="bCor">กำหนดมุม 4 จุด</button>
+<button id="bRe">เริ่มติดตามใหม่</button>
+</div></div>
+<script>
+const $=id=>document.getElementById(id);
+const stage=$('stage'),video=$('video'),ov=$('ov'),glc=$('gl'),octx=ov.getContext('2d');
+const pc=document.createElement('canvas'),pctx=pc.getContext('2d',{willReadFrequently:true});
+let stream=null,cvReady=false,threeReady=false,mode='idle'; // idle | tap | track | lost
+let vw=0,vh=0,pw=320,ph=240,taps=[],corners=null,disp=null,pts=null,npts=0,since=0;
+let src=null,gray=null,prev=null,winSz,crit;
+let renderer,scene,camera,root,mats=[],curP,curQ,ONE,hasPose=false;
+
+function setStatus(t,c){$('status').textContent=t;$('dot').style.background=c||'#8a8fa8';}
+function loadScript(u,ms){return new Promise((res,rej)=>{const s=document.createElement('script');s.src=u;s.async=true;const t=setTimeout(()=>{s.remove();rej(new Error('timeout'));},ms||60000);s.onload=()=>{clearTimeout(t);res();};s.onerror=()=>{clearTimeout(t);rej(new Error(u));};document.head.appendChild(s);});}
+async function loadLib(urls,test,ms){for(const u of urls){try{await loadScript(u,ms);if(test())return true;}catch(e){}}return false;}
+
+/* ---------- Three.js ---------- */
+function setupThree(){
+  renderer=new THREE.WebGLRenderer({canvas:glc,alpha:true,antialias:true});
+  renderer.setClearColor(0x000000,0);
+  scene=new THREE.Scene();
+  camera=new THREE.PerspectiveCamera(60,4/3,0.01,100);
+  scene.add(new THREE.AmbientLight(0xffffff,0.75));
+  const dl=new THREE.DirectionalLight(0xffffff,0.6);dl.position.set(1,2,-1);scene.add(dl);
+  curP=new THREE.Vector3();curQ=new THREE.Quaternion();ONE=new THREE.Vector3(1,1,1);
+  root=new THREE.Group();root.matrixAutoUpdate=false;root.visible=false;scene.add(root);
+  const cube=new THREE.Group();cube.position.z=0.5;root.add(cube);
+  const col=[0xd62d20,0xff7a00,0x2fb344,0x1f5fd1,0xf5d90a,0xffffff]; // +x,-x,+y,-y,+z,-z
+  const s=1/3,inner=new THREE.MeshLambertMaterial({color:0x111111,transparent:true});
+  mats.push(inner);
+  const face=col.map(c=>{const m=new THREE.MeshLambertMaterial({color:c,transparent:true});mats.push(m);return m;});
+  const g=new THREE.BoxGeometry(s*.96,s*.96,s*.96);
+  for(let i=-1;i<=1;i++)for(let j=-1;j<=1;j++)for(let k=-1;k<=1;k++){
+    const m=[i===1?face[0]:inner,i===-1?face[1]:inner,j===1?face[2]:inner,j===-1?face[3]:inner,k===1?face[4]:inner,k===-1?face[5]:inner];
+    const c=new THREE.Mesh(g,m);c.position.set(i*s,j*s,k*s);cube.add(c);
+  }
+  setOpacity();fit();
+}
+function setOpacity(){const v=$('op').value/100;mats.forEach(m=>m.opacity=v);}
+$('op').addEventListener('input',setOpacity);
+
+/* ---------- Layout ---------- */
+function fit(){
+  const W=innerWidth,H=innerHeight;let w=W,h=H;
+  if(vw){const r=vw/vh;if(W/H>r){w=H*r}else{h=W/r}}
+  stage.style.width=w+'px';stage.style.height=h+'px';ov.width=Math.round(w);ov.height=Math.round(h);
+  if(renderer){renderer.setPixelRatio(Math.min(devicePixelRatio||1,2));renderer.setSize(w,h,false);}
+  if(camera&&vw){camera.aspect=vw/vh;camera.fov=2*Math.atan(vh/2/(0.8*Math.max(vw,vh)))*180/Math.PI;camera.updateProjectionMatrix();}
+}
+addEventListener('resize',fit);
+
+/* ---------- Camera ---------- */
+function freeMats(){[src,gray,prev].forEach(m=>{try{m&&m.delete();}catch(e){}});src=gray=prev=null;}
+function alloc(){
+  freeMats();ph=Math.round(pw*vh/vw);pc.width=pw;pc.height=ph;
+  if(cvReady){src=new cv.Mat(ph,pw,cv.CV_8UC4);gray=new cv.Mat(ph,pw,cv.CV_8UC1);prev=new cv.Mat(ph,pw,cv.CV_8UC1);}
+}
+async function startCam(){
+  if(location.protocol==='file:'){setStatus('เปิดจาก file:// ไม่ได้ — กล้องต้องใช้ HTTPS (เช่น GitHub Pages)','#e5484d');return;}
+  if(!window.isSecureContext||!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){setStatus('เบราว์เซอร์นี้ไม่รองรับกล้อง หรือหน้านี้ไม่ใช่ HTTPS','#e5484d');return;}
+  const gum=c=>navigator.mediaDevices.getUserMedia(c);
+  try{
+    try{stream=await gum({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}},audio:false});}
+    catch(e){if(e.name==='NotAllowedError'||e.name==='SecurityError'||e.name==='NotReadableError')throw e;stream=await gum({video:true,audio:false});}
+    video.srcObject=stream;await video.play();
+    if(!video.videoWidth)await new Promise(r=>video.addEventListener('loadedmetadata',r,{once:true}));
+    vw=video.videoWidth;vh=video.videoHeight;alloc();fit();
+    $('bCam').textContent='ปิดกล้อง';
+    setStatus(cvReady?'กล้องพร้อม — กด "กำหนดมุม 4 จุด"':'กล้องพร้อม — รอโหลด OpenCV…','#2fb344');
+  }catch(e){
+    stopCam(true);
+    const m={NotAllowedError:'ไม่ได้รับอนุญาตใช้กล้อง — อนุญาตในการตั้งค่าเบราว์เซอร์',NotFoundError:'ไม่พบกล้องในอุปกรณ์',NotReadableError:'กล้องถูกใช้งานโดยแอปอื่น — ปิดแอปนั้นแล้วลองใหม่'};
+    setStatus(m[e.name]||('เปิดกล้องไม่สำเร็จ: '+(e.message||e.name)),'#e5484d');
+  }
+}
+function stopCam(silent){
+  if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
+  video.srcObject=null;mode='idle';taps=[];corners=disp=pts=null;npts=0;hasPose=false;
+  if(root)root.visible=false;freeMats();$('bCam').textContent='เปิดกล้อง';
+  if(!silent)setStatus('ปิดกล้องแล้ว');
+}
+$('bCam').onclick=()=>stream?stopCam():startCam();
+addEventListener('pagehide',()=>stopCam(true));
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&stream){stopCam(true);setStatus('ปิดกล้องอัตโนมัติเมื่อออกจากหน้านี้');}});
+
+/* ---------- Corner selection ---------- */
+function ready(){
+  if(!stream){setStatus('กรุณาเปิดกล้องก่อน','#e5484d');return false;}
+  if(!cvReady){setStatus('OpenCV ยังโหลดไม่เสร็จ รอสักครู่…','#f5a623');return false;}
+  return true;
+}
+$('bCor').onclick=()=>{
+  if(!ready())return;
+  taps=[];corners=disp=pts=null;npts=0;hasPose=false;root&&(root.visible=false);mode='tap';
+  setStatus('แตะมุมรูบิค: ซ้ายบน → ขวาบน → ขวาล่าง → ซ้ายล่าง (0/4)','#7c9cff');
+};
+ov.addEventListener('pointerdown',e=>{
+  if(mode!=='tap')return;
+  const r=ov.getBoundingClientRect();
+  taps.push({x:(e.clientX-r.left)/r.width*pw,y:(e.clientY-r.top)/r.height*ph});
+  const names=['ซ้ายบน','ขวาบน','ขวาล่าง','ซ้ายล่าง'];
+  if(taps.length<4){setStatus('แตะมุม'+names[taps.length]+' ('+taps.length+'/4)','#7c9cff');return;}
+  if(!convex(taps)||area(taps)<80){taps=[];setStatus('ลำดับมุมไม่ถูกต้อง ลองแตะใหม่ตามลำดับ ซ้ายบน→ขวาบน→ขวาล่าง→ซ้ายล่าง','#e5484d');return;}
+  corners=taps.map(p=>({x:p.x,y:p.y}));disp=taps.map(p=>({x:p.x,y:p.y}));taps=[];
+  startTrack();
+});
+$('bRe').onclick=()=>{
+  if(!ready())return;
+  if(!corners){$('bCor').onclick();return;}
+  startTrack();
+};
+function startTrack(){
+  grab();detect();
+  if(npts<8){mode='idle';setStatus('จุดเด่นบนรูบิคน้อยเกินไป ลองแสงสว่างขึ้นหรือแตะมุมใหม่','#e5484d');return;}
+  gray.copyTo(prev);since=0;mode='track';
+  setStatus('กำลังติดตามรูบิค…','#2fb344');
+}
+
+/* ---------- Vision ---------- */
+function area(q){let a=0;for(let i=0;i<4;i++){const p=q[i],n=q[(i+1)%4];a+=p.x*n.y-n.x*p.y;}return Math.abs(a/2);}
+function convex(q){let s=0;for(let i=0;i<4;i++){const a=q[i],b=q[(i+1)%4],c=q[(i+2)%4];const z=(b.x-a.x)*(c.y-b.y)-(b.y-a.y)*(c.x-b.x);if(z===0)return false;if(!s)s=Math.sign(z);else if(Math.sign(z)!==s)return false;}return true;}
+function grab(){
+  pctx.drawImage(video,0,0,pw,ph);
+  src.data.set(pctx.getImageData(0,0,pw,ph).data);
+  cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
+}
+function detect(){
+  const cx=corners.reduce((a,p)=>a+p.x,0)/4,cy=corners.reduce((a,p)=>a+p.y,0)/4,q=[];
+  corners.forEach(p=>q.push(Math.round(cx+(p.x-cx)*.9),Math.round(cy+(p.y-cy)*.9)));
+  const mask=cv.Mat.zeros(ph,pw,cv.CV_8UC1),qm=cv.matFromArray(4,1,cv.CV_32SC2,q),c=new cv.Mat();
+  cv.fillConvexPoly(mask,qm,new cv.Scalar(255));
+  cv.goodFeaturesToTrack(gray,c,120,0.01,4,mask,3,false,0.04);
+  npts=c.rows;pts=Float32Array.from(c.data32F.subarray(0,npts*2));
+  mask.delete();qm.delete();c.delete();
+}
+function lost(){
+  mode='lost';if(root)root.visible=false;hasPose=false;
+  setStatus('ตรวจจับหลุด — กด "เริ่มติดตามใหม่" หรือ "กำหนดมุม 4 จุด"','#e5484d');
+}
+function trackStep(){
+  if(npts<8){lost();return;}
+  const p0=cv.matFromArray(npts,1,cv.CV_32FC2,Array.from(pts)),p1=new cv.Mat(),st=new cv.Mat(),er=new cv.Mat();
+  cv.calcOpticalFlowPyrLK(prev,gray,p0,p1,st,er,winSz,3,crit);
+  const a=[],b=[];
+  for(let i=0;i<npts;i++)if(st.data[i]===1&&er.data32F[i]<25){a.push(pts[2*i],pts[2*i+1]);b.push(p1.data32F[2*i],p1.data32F[2*i+1]);}
+  p0.delete();p1.delete();st.delete();er.delete();
+  const n=a.length/2;if(n<8){lost();return;}
+  const A=cv.matFromArray(n,1,cv.CV_32FC2,a),B=cv.matFromArray(n,1,cv.CV_32FC2,b),M=new cv.Mat();
+  let H=null,ok=false,nc=null,inl=[];
+  try{
+    H=cv.findHomography(A,B,cv.RANSAC,3,M);
+    if(H&&H.rows===3&&H.cols===3){
+      const h=H.data64F;
+      nc=corners.map(p=>{const w=h[6]*p.x+h[7]*p.y+h[8];return {x:(h[0]*p.x+h[1]*p.y+h[2])/w,y:(h[3]*p.x+h[4]*p.y+h[5])/w};});
+      for(let i=0;i<n;i++)if(M.data[i])inl.push(b[2*i],b[2*i+1]);
+      const a0=area(corners),a1=area(nc);
+      ok=inl.length>=16&&convex(nc)&&a1>60&&a1/a0<1.6&&a1/a0>0.6&&nc.every(p=>isFinite(p.x)&&isFinite(p.y)&&p.x>-pw&&p.x<2*pw&&p.y>-ph&&p.y<2*ph);
+    }
+  }catch(e){ok=false;}
+  A.delete();B.delete();M.delete();if(H)H.delete();
+  if(!ok){lost();return;}
+  corners=nc;pts=Float32Array.from(inl);npts=inl.length/2;since++;
+  disp=disp.map((p,i)=>({x:p.x+(nc[i].x-p.x)*.6,y:p.y+(nc[i].y-p.y)*.6}));
+  if(npts<40||since>25){detect();since=0;if(npts<8){lost();return;}}
+  updatePose();
+}
+
+/* ---------- Pose from 4 corners ---------- */
+function homog(s,d){
+  const A=[];
+  for(let i=0;i<4;i++){const [x,y]=s[i],[u,v]=d[i];A.push([x,y,1,0,0,0,-u*x,-u*y,u],[0,0,0,x,y,1,-v*x,-v*y,v]);}
+  for(let c=0;c<8;c++){
+    let p=c;for(let r=c+1;r<8;r++)if(Math.abs(A[r][c])>Math.abs(A[p][c]))p=r;
+    if(Math.abs(A[p][c])<1e-9)return null;
+    [A[c],A[p]]=[A[p],A[c]];
+    for(let r=0;r<8;r++){if(r===c)continue;const k=A[r][c]/A[c][c];for(let j=c;j<9;j++)A[r][j]-=k*A[c][j];}
+  }
+  const h=[];for(let i=0;i<8;i++)h.push(A[i][8]/A[i][i]);h.push(1);return h;
+}
+function updatePose(){
+  if(!threeReady)return;
+  const sx=vw/pw,sy=vh/ph,f=0.8*Math.max(vw,vh),cx=vw/2,cy=vh/2;
+  const H=homog([[-.5,-.5],[.5,-.5],[.5,.5],[-.5,.5]],disp.map(p=>[p.x*sx,p.y*sy]));
+  if(!H)return;
+  const col=j=>{const x=H[j],y=H[3+j],z=H[6+j];return new THREE.Vector3((x-cx*z)/f,(y-cy*z)/f,z);};
+  const a1=col(0),a2=col(1),a3=col(2),l=2/(a1.length()+a2.length());
+  const r1=a1.multiplyScalar(l),r2=a2.multiplyScalar(l),t=a3.multiplyScalar(l);
+  if(t.z<0){r1.negate();r2.negate();t.negate();}
+  r1.normalize();const r3=new THREE.Vector3().crossVectors(r1,r2).normalize();r2.crossVectors(r3,r1);
+  const m=new THREE.Matrix4().set(r1.x,r2.x,r3.x,t.x,-r1.y,-r2.y,-r3.y,-t.y,-r1.z,-r2.z,-r3.z,-t.z,0,0,0,1);
+  const p=new THREE.Vector3(),q=new THREE.Quaternion(),s=new THREE.Vector3();
+  m.decompose(p,q,s);
+  if(!hasPose){curP.copy(p);curQ.copy(q);hasPose=true;}else{curP.lerp(p,.55);curQ.slerp(q,.55);}
+  root.matrix.compose(curP,curQ,ONE);root.visible=true;
+}
+
+/* ---------- Main loop ---------- */
+function drawOverlay(){
+  octx.clearRect(0,0,ov.width,ov.height);
+  const kx=ov.width/pw,ky=ov.height/ph;
+  const q=mode==='tap'?taps:(mode==='track'?disp:null);
+  if(q&&q.length){
+    octx.strokeStyle=mode==='tap'?'#7c9cff':'rgba(47,179,68,.8)';octx.lineWidth=2;octx.beginPath();
+    q.forEach((p,i)=>i?octx.lineTo(p.x*kx,p.y*ky):octx.moveTo(p.x*kx,p.y*ky));
+    if(q.length===4)octx.closePath();octx.stroke();
+  }
+  if(mode==='tap'){octx.font='bold 14px sans-serif';taps.forEach((p,i)=>{octx.fillStyle='#7c9cff';octx.beginPath();octx.arc(p.x*kx,p.y*ky,9,0,7);octx.fill();octx.fillStyle='#fff';octx.fillText(i+1,p.x*kx+12,p.y*ky-8);});}
+}
+function loop(){
+  requestAnimationFrame(loop);
+  try{
+    if(stream&&vw&&video.readyState>=2&&mode==='track'&&cvReady&&src){
+      grab();trackStep();if(mode==='track')gray.copyTo(prev);
+    }
+    drawOverlay();
+    if(renderer)renderer.render(scene,camera);
+  }catch(e){console.error(e);mode='idle';setStatus('เกิดข้อผิดพลาดในการประมวลผล กรุณากำหนดมุมใหม่','#e5484d');}
+}
+
+/* ---------- Boot ---------- */
+async function boot(){
+  fit();loop();
+  setStatus('กำลังโหลด Three.js…','#f5a623');
+  threeReady=await loadLib(['https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js','https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js'],()=>!!window.THREE);
+  if(threeReady){try{setupThree();}catch(e){threeReady=false;}}
+  if(!threeReady){setStatus('โหลด Three.js ไม่สำเร็จ — ตรวจสอบอินเทอร์เน็ตแล้วรีเฟรช','#e5484d');return;}
+  const t0=Date.now();
+  const tick=setInterval(()=>setStatus('กำลังโหลด OpenCV.js (~8 MB) '+Math.round((Date.now()-t0)/1000)+' วินาที… หากเกิน 45 วินาทีจะสลับแหล่งโหลดอัตโนมัติ','#f5a623'),500);
+  const ok=await loadLib(['https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.9.0-release.5/dist/opencv.js','https://docs.opencv.org/4.x/opencv.js'],()=>!!window.cv,45000);
+  if(ok){
+    try{
+      let c=window.cv;
+      if(typeof c.then==='function'){c=await c;window.cv=c;}
+      if(!c.Mat)await Promise.race([new Promise(r=>{c.onRuntimeInitialized=r;}),new Promise(r=>setTimeout(r,60000))]);
+      cvReady=!!(window.cv&&window.cv.Mat);
+    }catch(e){cvReady=false;}
+  }
+  clearInterval(tick);
+  if(!cvReady){setStatus('โหลด OpenCV.js ไม่สำเร็จ — ตรวจสอบอินเทอร์เน็ตแล้วรีเฟรช','#e5484d');return;}
+  winSz=new cv.Size(21,21);crit=new cv.TermCriteria(cv.TermCriteria_EPS|cv.TermCriteria_COUNT,20,0.03);
+  if(stream&&vw)alloc();
+  setStatus(stream?'ไลบรารีพร้อม — กด "กำหนดมุม 4 จุด"':'ไลบรารีพร้อม — กด "เปิดกล้อง"','#2fb344');
+}
+boot();
+</script>
+</body>
+</html>

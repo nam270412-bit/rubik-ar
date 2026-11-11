@@ -43,8 +43,7 @@ const $=id=>document.getElementById(id);
 const stage=$('stage'),video=$('video'),ov=$('ov'),glc=$('gl'),octx=ov.getContext('2d');
 const pc=document.createElement('canvas'),pctx=pc.getContext('2d',{willReadFrequently:true});
 let stream=null,cvReady=false,threeReady=false,mode='idle'; // idle | tap | track | lost
-let vw=0,vh=0,pw=320,ph=240,taps=[],corners=null,disp=null,pts=null,npts=0,since=0;
-let src=null,gray=null,prev=null,winSz,crit;
+let vw=0,vh=0,pw=256,ph=192,taps=[],corners=null,disp=null,pts=null,npts=0,since=0;
 let renderer,scene,camera,root,mats=[],curP,curQ,ONE,hasPose=false;
 
 function setStatus(t,c){$('status').textContent=t;$('dot').style.background=c||'#8a8fa8';}
@@ -87,10 +86,9 @@ function fit(){
 addEventListener('resize',fit);
 
 /* ---------- Camera ---------- */
-function freeMats(){[src,gray,prev].forEach(m=>{try{m&&m.delete();}catch(e){}});src=gray=prev=null;}
+function freeMats(){prevPyr=curPyr=null;}
 function alloc(){
   freeMats();ph=Math.round(pw*vh/vw);pc.width=pw;pc.height=ph;
-  if(cvReady){src=new cv.Mat(ph,pw,cv.CV_8UC4);gray=new cv.Mat(ph,pw,cv.CV_8UC1);prev=new cv.Mat(ph,pw,cv.CV_8UC1);}
 }
 async function startCam(){
   if(location.protocol==='file:'){setStatus('เปิดจาก file:// ไม่ได้ — กล้องต้องใช้ HTTPS (เช่น GitHub Pages)','#e5484d');return;}
@@ -103,7 +101,7 @@ async function startCam(){
     if(!video.videoWidth)await new Promise(r=>video.addEventListener('loadedmetadata',r,{once:true}));
     vw=video.videoWidth;vh=video.videoHeight;alloc();fit();
     $('bCam').textContent='ปิดกล้อง';
-    setStatus(cvReady?'กล้องพร้อม — กด "กำหนดมุม 4 จุด"':'กล้องพร้อม — รอโหลด OpenCV…','#2fb344');
+    setStatus(cvReady?'กล้องพร้อม — กด "กำหนดมุม 4 จุด"':'กล้องพร้อม — รอโหลดไลบรารี…','#2fb344');
   }catch(e){
     stopCam(true);
     const m={NotAllowedError:'ไม่ได้รับอนุญาตใช้กล้อง — อนุญาตในการตั้งค่าเบราว์เซอร์',NotFoundError:'ไม่พบกล้องในอุปกรณ์',NotReadableError:'กล้องถูกใช้งานโดยแอปอื่น — ปิดแอปนั้นแล้วลองใหม่'};
@@ -123,7 +121,7 @@ document.addEventListener('visibilitychange',()=>{if(document.hidden&&stream){st
 /* ---------- Corner selection ---------- */
 function ready(){
   if(!stream){setStatus('กรุณาเปิดกล้องก่อน','#e5484d');return false;}
-  if(!cvReady){setStatus('OpenCV ยังโหลดไม่เสร็จ รอสักครู่…','#f5a623');return false;}
+  if(!cvReady){setStatus('ไลบรารียังโหลดไม่เสร็จ รอสักครู่…','#f5a623');return false;}
   return true;
 }
 $('bCor').onclick=()=>{
@@ -149,54 +147,142 @@ $('bRe').onclick=()=>{
 function startTrack(){
   grab();detect();
   if(npts<8){mode='idle';setStatus('จุดเด่นบนรูบิคน้อยเกินไป ลองแสงสว่างขึ้นหรือแตะมุมใหม่','#e5484d');return;}
-  gray.copyTo(prev);since=0;mode='track';
+  prevPyr=curPyr;since=0;mode='track';
   setStatus('กำลังติดตามรูบิค…','#2fb344');
 }
 
-/* ---------- Vision ---------- */
+/* ---------- Vision (JavaScript ล้วน ไม่ใช้ OpenCV) ---------- */
+let curPyr=null,prevPyr=null;
 function area(q){let a=0;for(let i=0;i<4;i++){const p=q[i],n=q[(i+1)%4];a+=p.x*n.y-n.x*p.y;}return Math.abs(a/2);}
 function convex(q){let s=0;for(let i=0;i<4;i++){const a=q[i],b=q[(i+1)%4],c=q[(i+2)%4];const z=(b.x-a.x)*(c.y-b.y)-(b.y-a.y)*(c.x-b.x);if(z===0)return false;if(!s)s=Math.sign(z);else if(Math.sign(z)!==s)return false;}return true;}
+function buildPyr(d){
+  const L=[{w:pw,h:ph,d}];
+  for(let l=1;l<3;l++){const p=L[l-1],w=p.w>>1,h=p.h>>1,o=new Float32Array(w*h);
+    for(let y=0;y<h;y++)for(let x=0;x<w;x++){const i=2*y*p.w+2*x;o[y*w+x]=(p.d[i]+p.d[i+1]+p.d[i+p.w]+p.d[i+p.w+1])/4;}
+    L.push({w,h,d:o});}
+  return L;
+}
 function grab(){
   pctx.drawImage(video,0,0,pw,ph);
-  src.data.set(pctx.getImageData(0,0,pw,ph).data);
-  cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
+  const px=pctx.getImageData(0,0,pw,ph).data,g=new Float32Array(pw*ph);
+  for(let i=0,j=0;i<g.length;i++,j+=4)g[i]=.299*px[j]+.587*px[j+1]+.114*px[j+2];
+  curPyr=buildPyr(g);
+}
+function samp(I,x,y){
+  if(x<0)x=0;else if(x>I.w-1.001)x=I.w-1.001;
+  if(y<0)y=0;else if(y>I.h-1.001)y=I.h-1.001;
+  const x0=x|0,y0=y|0,fx=x-x0,fy=y-y0,i=y0*I.w+x0,d=I.d,w=I.w;
+  return d[i]*(1-fx)*(1-fy)+d[i+1]*fx*(1-fy)+d[i+w]*(1-fx)*fy+d[i+w+1]*fx*fy;
 }
 function detect(){
-  const cx=corners.reduce((a,p)=>a+p.x,0)/4,cy=corners.reduce((a,p)=>a+p.y,0)/4,q=[];
-  corners.forEach(p=>q.push(Math.round(cx+(p.x-cx)*.9),Math.round(cy+(p.y-cy)*.9)));
-  const mask=cv.Mat.zeros(ph,pw,cv.CV_8UC1),qm=cv.matFromArray(4,1,cv.CV_32SC2,q),c=new cv.Mat();
-  cv.fillConvexPoly(mask,qm,new cv.Scalar(255));
-  cv.goodFeaturesToTrack(gray,c,120,0.01,4,mask,3,false,0.04);
-  npts=c.rows;pts=Float32Array.from(c.data32F.subarray(0,npts*2));
-  mask.delete();qm.delete();c.delete();
+  const I=curPyr[0],w=I.w,h=I.h,d=I.d;
+  const cx=corners.reduce((a,p)=>a+p.x,0)/4,cy=corners.reduce((a,p)=>a+p.y,0)/4;
+  const q=corners.map(p=>({x:cx+(p.x-cx)*.9,y:cy+(p.y-cy)*.9}));
+  const inside=(x,y)=>{let s=0;for(let i=0;i<4;i++){const a=q[i],b=q[(i+1)%4],z=(b.x-a.x)*(y-a.y)-(b.y-a.y)*(x-a.x);if(z===0)continue;if(!s)s=Math.sign(z);else if(Math.sign(z)!==s)return false;}return true;};
+  const ix=new Float32Array(w*h),iy=new Float32Array(w*h);
+  for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){const i=y*w+x;ix[i]=(d[i+1]-d[i-1])/2;iy[i]=(d[i+w]-d[i-w])/2;}
+  const x0=Math.max(3,Math.floor(Math.min(...q.map(p=>p.x)))),x1=Math.min(w-4,Math.ceil(Math.max(...q.map(p=>p.x))));
+  const y0=Math.max(3,Math.floor(Math.min(...q.map(p=>p.y)))),y1=Math.min(h-4,Math.ceil(Math.max(...q.map(p=>p.y))));
+  const cand=[];
+  for(let y=y0;y<=y1;y++)for(let x=x0;x<=x1;x++){
+    if(!inside(x,y))continue;
+    let a=0,b=0,c=0;
+    for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){const i=(y+dy)*w+x+dx,gx=ix[i],gy=iy[i];a+=gx*gx;b+=gx*gy;c+=gy*gy;}
+    cand.push([(a+c-Math.sqrt((a-c)*(a-c)+4*b*b))/2,x,y]);
+  }
+  cand.sort((u,v)=>v[0]-u[0]);
+  const thr=cand.length?cand[0][0]*.05:0,out=[],md=6;
+  for(const [e,x,y] of cand){
+    if(e<thr||out.length>=180)break;
+    let ok=true;for(let k=0;k<out.length;k+=2){const dx=out[k]-x,dy=out[k+1]-y;if(dx*dx+dy*dy<md*md){ok=false;break;}}
+    if(ok)out.push(x,y);
+  }
+  pts=Float32Array.from(out);npts=out.length/2;
+}
+function lk(P,Q){
+  const R=6,N=2*R+1,n=npts,nx=new Float32Array(2*n),st=new Uint8Array(n);
+  const gx=new Float32Array(N*N),gy=new Float32Array(N*N),pv=new Float32Array(N*N);
+  for(let k=0;k<n;k++){
+    let vx=0,vy=0,ok=1;
+    for(let l=2;l>=0&&ok;l--){
+      const A=P[l],B=Q[l],s=1<<l,px=pts[2*k]/s,py=pts[2*k+1]/s;
+      if(l<2){vx*=2;vy*=2;}
+      let a=0,b=0,c=0,m=0;
+      for(let j=-R;j<=R;j++)for(let i=-R;i<=R;i++){
+        const X=px+i,Y=py+j,dx=(samp(A,X+1,Y)-samp(A,X-1,Y))/2,dy=(samp(A,X,Y+1)-samp(A,X,Y-1))/2;
+        gx[m]=dx;gy[m]=dy;pv[m]=samp(A,X,Y);a+=dx*dx;b+=dx*dy;c+=dy*dy;m++;
+      }
+      const det=a*c-b*b,tr=a+c,mn=(tr-Math.sqrt(Math.max(0,tr*tr-4*det)))/2;
+      if(det<1e-6||mn<m*.3){ok=0;break;}
+      for(let it=0;it<8;it++){
+        let e1=0,e2=0;m=0;
+        for(let j=-R;j<=R;j++)for(let i=-R;i<=R;i++){const e=pv[m]-samp(B,px+i+vx,py+j+vy);e1+=gx[m]*e;e2+=gy[m]*e;m++;}
+        const ux=(c*e1-b*e2)/det,uy=(a*e2-b*e1)/det;vx+=ux;vy+=uy;
+        if(ux*ux+uy*uy<4e-4)break;
+      }
+    }
+    const X=pts[2*k]+vx,Y=pts[2*k+1]+vy;
+    nx[2*k]=X;nx[2*k+1]=Y;
+    st[k]=(ok&&X>2&&Y>2&&X<pw-3&&Y<ph-3&&Math.abs(vx)<pw/3&&Math.abs(vy)<ph/3)?1:0;
+  }
+  return {nx,st};
+}
+function solve8(M){
+  for(let c=0;c<8;c++){
+    let p=c;for(let r=c+1;r<8;r++)if(Math.abs(M[r][c])>Math.abs(M[p][c]))p=r;
+    if(Math.abs(M[p][c])<1e-12)return null;
+    [M[c],M[p]]=[M[p],M[c]];
+    for(let r=0;r<8;r++){if(r===c)continue;const k=M[r][c]/M[c][c];for(let j=c;j<9;j++)M[r][j]-=k*M[c][j];}
+  }
+  const h=[];for(let i=0;i<8;i++)h.push(M[i][8]/M[i][i]);return h;
+}
+function mul3(A,B){const C=new Array(9).fill(0);for(let i=0;i<3;i++)for(let j=0;j<3;j++)for(let k=0;k<3;k++)C[3*i+j]+=A[3*i+k]*B[3*k+j];return C;}
+function homogLS(S,D){
+  const n=S.length,K=100;let sx=0,sy=0,dx=0,dy=0;
+  for(let i=0;i<n;i++){sx+=S[i][0];sy+=S[i][1];dx+=D[i][0];dy+=D[i][1];}
+  sx/=n;sy/=n;dx/=n;dy/=n;
+  const M=[];for(let r=0;r<8;r++)M.push(new Array(9).fill(0));
+  for(let i=0;i<n;i++){
+    const x=(S[i][0]-sx)/K,y=(S[i][1]-sy)/K,u=(D[i][0]-dx)/K,v=(D[i][1]-dy)/K;
+    for(const r of [[x,y,1,0,0,0,-u*x,-u*y,u],[0,0,0,x,y,1,-v*x,-v*y,v]])
+      for(let p=0;p<8;p++)for(let q=0;q<9;q++)M[p][q]+=r[p]*r[q];
+  }
+  const h=solve8(M);if(!h)return null;
+  const Ts=[1/K,0,-sx/K,0,1/K,-sy/K,0,0,1],Td=[K,0,dx,0,K,dy,0,0,1];
+  return mul3(Td,mul3([...h,1],Ts));
+}
+function app(H,x,y){const w=H[6]*x+H[7]*y+H[8];return [(H[0]*x+H[1]*y+H[2])/w,(H[3]*x+H[4]*y+H[5])/w];}
+function ransac(a,b){
+  const n=a.length/2;let best=null,bc=0;
+  for(let it=0;it<80;it++){
+    const idx=[];while(idx.length<4){const r=(Math.random()*n)|0;if(!idx.includes(r))idx.push(r);}
+    const H=homogLS(idx.map(i=>[a[2*i],a[2*i+1]]),idx.map(i=>[b[2*i],b[2*i+1]]));
+    if(!H)continue;
+    let c=0;for(let i=0;i<n;i++){const p=app(H,a[2*i],a[2*i+1]),ex=p[0]-b[2*i],ey=p[1]-b[2*i+1];if(ex*ex+ey*ey<9)c++;}
+    if(c>bc){bc=c;best=H;}
+  }
+  if(!best||bc<10)return null;
+  const S=[],D=[];
+  for(let i=0;i<n;i++){const p=app(best,a[2*i],a[2*i+1]),ex=p[0]-b[2*i],ey=p[1]-b[2*i+1];if(ex*ex+ey*ey<9){S.push([a[2*i],a[2*i+1]]);D.push([b[2*i],b[2*i+1]]);}}
+  const H2=homogLS(S,D)||best,inl=[];
+  for(let i=0;i<n;i++){const p=app(H2,a[2*i],a[2*i+1]),ex=p[0]-b[2*i],ey=p[1]-b[2*i+1];if(ex*ex+ey*ey<16)inl.push(b[2*i],b[2*i+1]);}
+  return {H:H2,inl};
 }
 function lost(){
   mode='lost';if(root)root.visible=false;hasPose=false;
   setStatus('ตรวจจับหลุด — กด "เริ่มติดตามใหม่" หรือ "กำหนดมุม 4 จุด"','#e5484d');
 }
 function trackStep(){
-  if(npts<8){lost();return;}
-  const p0=cv.matFromArray(npts,1,cv.CV_32FC2,Array.from(pts)),p1=new cv.Mat(),st=new cv.Mat(),er=new cv.Mat();
-  cv.calcOpticalFlowPyrLK(prev,gray,p0,p1,st,er,winSz,3,crit);
-  const a=[],b=[];
-  for(let i=0;i<npts;i++)if(st.data[i]===1&&er.data32F[i]<25){a.push(pts[2*i],pts[2*i+1]);b.push(p1.data32F[2*i],p1.data32F[2*i+1]);}
-  p0.delete();p1.delete();st.delete();er.delete();
-  const n=a.length/2;if(n<8){lost();return;}
-  const A=cv.matFromArray(n,1,cv.CV_32FC2,a),B=cv.matFromArray(n,1,cv.CV_32FC2,b),M=new cv.Mat();
-  let H=null,ok=false,nc=null,inl=[];
-  try{
-    H=cv.findHomography(A,B,cv.RANSAC,3,M);
-    if(H&&H.rows===3&&H.cols===3){
-      const h=H.data64F;
-      nc=corners.map(p=>{const w=h[6]*p.x+h[7]*p.y+h[8];return {x:(h[0]*p.x+h[1]*p.y+h[2])/w,y:(h[3]*p.x+h[4]*p.y+h[5])/w};});
-      for(let i=0;i<n;i++)if(M.data[i])inl.push(b[2*i],b[2*i+1]);
-      const a0=area(corners),a1=area(nc);
-      ok=inl.length>=16&&convex(nc)&&a1>60&&a1/a0<1.6&&a1/a0>0.6&&nc.every(p=>isFinite(p.x)&&isFinite(p.y)&&p.x>-pw&&p.x<2*pw&&p.y>-ph&&p.y<2*ph);
-    }
-  }catch(e){ok=false;}
-  A.delete();B.delete();M.delete();if(H)H.delete();
+  if(npts<8||!prevPyr){lost();return;}
+  const r=lk(prevPyr,curPyr),a=[],b=[];
+  for(let i=0;i<npts;i++)if(r.st[i]){a.push(pts[2*i],pts[2*i+1]);b.push(r.nx[2*i],r.nx[2*i+1]);}
+  if(a.length<24){lost();return;}
+  const R=ransac(a,b);if(!R){lost();return;}
+  const nc=corners.map(p=>{const q=app(R.H,p.x,p.y);return {x:q[0],y:q[1]};});
+  const a0=area(corners),a1=area(nc);
+  const ok=R.inl.length>=24&&convex(nc)&&a1>60&&a1/a0<1.6&&a1/a0>.6&&nc.every(p=>isFinite(p.x)&&isFinite(p.y)&&p.x>-pw&&p.x<2*pw&&p.y>-ph&&p.y<2*ph);
   if(!ok){lost();return;}
-  corners=nc;pts=Float32Array.from(inl);npts=inl.length/2;since++;
+  corners=nc;pts=Float32Array.from(R.inl);npts=R.inl.length/2;since++;
   disp=disp.map((p,i)=>({x:p.x+(nc[i].x-p.x)*.6,y:p.y+(nc[i].y-p.y)*.6}));
   if(npts<40||since>25){detect();since=0;if(npts<8){lost();return;}}
   updatePose();
@@ -246,8 +332,8 @@ function drawOverlay(){
 function loop(){
   requestAnimationFrame(loop);
   try{
-    if(stream&&vw&&video.readyState>=2&&mode==='track'&&cvReady&&src){
-      grab();trackStep();if(mode==='track')gray.copyTo(prev);
+    if(stream&&vw&&video.readyState>=2&&mode==='track'){
+      grab();trackStep();if(mode==='track')prevPyr=curPyr;
     }
     drawOverlay();
     if(renderer)renderer.render(scene,camera);
@@ -261,20 +347,7 @@ async function boot(){
   threeReady=await loadLib(['https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js','https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js'],()=>!!window.THREE);
   if(threeReady){try{setupThree();}catch(e){threeReady=false;}}
   if(!threeReady){setStatus('โหลด Three.js ไม่สำเร็จ — ตรวจสอบอินเทอร์เน็ตแล้วรีเฟรช','#e5484d');return;}
-  const t0=Date.now();
-  const tick=setInterval(()=>setStatus('กำลังโหลด OpenCV.js (~8 MB) '+Math.round((Date.now()-t0)/1000)+' วินาที… หากเกิน 45 วินาทีจะสลับแหล่งโหลดอัตโนมัติ','#f5a623'),500);
-  const ok=await loadLib(['https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.9.0-release.5/dist/opencv.js','https://docs.opencv.org/4.x/opencv.js'],()=>!!window.cv,45000);
-  if(ok){
-    try{
-      let c=window.cv;
-      if(typeof c.then==='function'){c=await c;window.cv=c;}
-      if(!c.Mat)await Promise.race([new Promise(r=>{c.onRuntimeInitialized=r;}),new Promise(r=>setTimeout(r,60000))]);
-      cvReady=!!(window.cv&&window.cv.Mat);
-    }catch(e){cvReady=false;}
-  }
-  clearInterval(tick);
-  if(!cvReady){setStatus('โหลด OpenCV.js ไม่สำเร็จ — ตรวจสอบอินเทอร์เน็ตแล้วรีเฟรช','#e5484d');return;}
-  winSz=new cv.Size(21,21);crit=new cv.TermCriteria(cv.TermCriteria_EPS|cv.TermCriteria_COUNT,20,0.03);
+  cvReady=true;
   if(stream&&vw)alloc();
   setStatus(stream?'ไลบรารีพร้อม — กด "กำหนดมุม 4 จุด"':'ไลบรารีพร้อม — กด "เปิดกล้อง"','#2fb344');
 }
